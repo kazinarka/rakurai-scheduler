@@ -1,0 +1,7 @@
+# sensitive — never commit
+/keys
+
+# local editor / Claude settings
+.claude/settings.local.json
+
+# (binaries intentionally tracked: /bin, /extracted)
