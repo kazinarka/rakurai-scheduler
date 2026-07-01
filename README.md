@@ -156,6 +156,17 @@ The greedy loop (`rakurai_schedule`, confirmed calls): repeatedly `pop_max` → 
 → conflict check → thread select → accumulate into a per-thread batch → `send_batch`; txs that can't
 be placed now are `MinMaxHeap::push`ed back or redumped.
 
+**Container internals (`push_ids_into_queue`).** The container is not just a heap. Insertion
+(`RakuraiTransactionContainer::push_ids_into_queue`) maintains **both**:
+- the `MinMaxHeap<(priority, id)>` (the pop-order structure), and
+- an `alloc::collections::BTreeMap` used as an ordered secondary index (calls
+  `BTreeMap VacantEntry::insert_entry` on insert and `OccupiedEntry::remove_kv` on removal).
+
+The BTreeMap gives ordered iteration / range operations the heap can't (e.g. deterministic
+tie-break and bulk requeue by key), while the heap gives O(1) best/worst access. IDs come from the
+`slab`; the heap and BTree hold ids, the slab holds the heavy `RuntimeTransaction`. Insertion panics
+rather than overwrite when `len() >= capacity` (100000).
+
 ### 5.3 Conflict detection — `ThreadAwareAccountLocks` (which threads are *eligible*)
 
 Before a tx can run on a thread it must not conflict with account locks already held by other
@@ -232,6 +243,18 @@ float constants: `0x378548 = 2^63`, `0x378000 = 2^64` (u64↔f64 saturation), `0
   `refresh_if_needed` to expire txs whose blockhash has aged out. Net: every tx is scheduled,
   requeued, or expired — never silently lost.
 
+**Retry / backoff mechanism (detail).**
+- `get_retry_interval_times_ms` builds a small (`0x30`-byte) vector of retry interval times in
+  milliseconds from the slot timing (uses the u64→f64 conversion path and a `>>1, +1` halving step)
+  — a computed backoff schedule rather than a fixed constant, so throttled txs are retried on a
+  spaced cadence within the slot.
+- `retry_interval_tx_ids` (scheduler_1, ~4 KB): the per-interval retry driver — drains due txs and
+  `push_ids_into_queue`s them back at their priority.
+- `retry_tx_end_of_slot`: end-of-slot cleanup — repeatedly `MinMaxHeap::pop_max` (drains the heap)
+  and re-queues via `push_ids_into_queue`, resetting for the next slot.
+- `refresh_if_needed`: checks each requeued tx's blockhash age and drops it if it can no longer be
+  included (prevents retrying already-expired transactions).
+
 ### 5.8 Two scheduler families
 
 - **scheduler_1** (`Controller<R,S>`): the greedy MinMaxHeap packer described above. No graph.
@@ -295,7 +318,28 @@ slot. This is scheduler_2's distinguishing feature over scheduler_1. The exact p
 - sanitizes and clones into a `RuntimeTransaction`, then hands it to the container / classifier.
 
 `deserialize_and_push_received_batches` (20239 bytes) is the batch driver that loops packets through
-`try_handle_packet` and pushes accepted txs.
+`try_handle_packet` and pushes accepted txs. `generate_packet_indexes` builds an index table over an
+incoming batch for fast iteration during this loop.
+
+### 6.2b Packet-acceptance filters — mode1 vs mode2 (the inclusion decision)
+
+The receiver applies one of two filters (selected by the transaction-source mode, §4) to decide
+whether a packet is accepted and how it is classified. **This is where a packet is admitted or
+rejected.**
+
+- **`is_mode1_filtered`** (1599 B, the *light* filter): `PacketRef::deserialize_slice` →
+  `SanitizedTransaction::try_new`, then checks packet-meta flag bits (e.g. `packet.meta >> 3 & 1`)
+  and a type/mode field (`== 2` comparisons). It resolves the sanitized transaction and screens on
+  structural validity + meta flags. No fee/cost computation.
+- **`is_mode2_filtered`** (4477 B, the *heavy* filter): `PacketRef::deserialize_slice` →
+  `SanitizedTransaction::try_new` → **`solana_fee::calculate_fee_details`** →
+  **`solana_cost_model::CostModel::calculate_cost`**. Mode 2 fully prices the transaction — it
+  computes the actual fee details and the compute-unit cost — and filters on those. This is the mode
+  that lets the scheduler reason about economic value (fee + cost) at admission time, feeding the
+  priority/tip decisions downstream.
+
+In short: mode 1 = cheap structural admission; mode 2 = full fee/cost-model admission. Both produce
+a `RuntimeTransaction` that then flows into the container and (if tip-bearing) the fast lane.
 
 ### 6.3 Tip / MEV valuation ("their own packets" = tip-paying user txs, re-prioritized)
 
@@ -446,5 +490,210 @@ wire; no hardcoded exfil host.
 | `set_rakurai_tip_accounts.c`, `rakurai_tip_amount_from_transaction.c`, `fetch_bundle_tip.c`, `check_bundle_feasability.c` | tip / bundle valuation |
 | `SwitchingController_new.c`, `SwitchingController_verify_signature.c`, `SwitchingController_create_message.c`, `rakurai_enabled.c`, `force_switch_to_standard.c`, `check_state.c`, `reset_rakurai.c`, `initial_check_state_for_standard.c`, `initial_check_state_for_rakurai.c` | control plane |
 | `notifier_run.c`, `notifier_new.c`, `sync_postpack_confirmation_config.c`, `endpoint_from_url.c`, `dispatch_scheduler_update.c` | network / postpack |
+
+Analyzed artifact: `extracted/librak_scheduler_4_0_3_0.so` (BuildID `b9350e46e896b42a0adc5c4ca0d0cc3741592724`).
+
+---
+
+# APPENDIX A — Memory & struct layout maps
+
+All offsets observed directly in the decompilation. `struct` = the scheduler Controller object.
+
+### A.1 `scheduler_1::Controller` (0x200-byte header + inline sub-structs; from `Controller::new`)
+
+| Offset | Field / meaning |
+|---|---|
+| +0x280 | ring buffer of realized-CU samples (feedback for CU estimate) |
+| +0x288 | ring capacity (init 8) |
+| +0x2a0 | thread count (init 8) |
+| +0x2c0 | crossbeam `Receiver` #1 (normal tx lane) |
+| +0x2d0 | crossbeam `Receiver` #2 (second tx lane) |
+| +0x7b0 | **high-priority transaction `Sender`** (tip fast lane) |
+| +0x7c0 | last-update timestamp (for CU feedback) |
+| +0x7d8 / +0x7e8 | CU budget target (seeded slot_duration × 0.85) |
+| +0x7e0 | early-slot ramp = `(target >> 2) − 5` |
+| +0x7f0 | initial per-thread CU seed = 50,000,000 |
+| +0x7f8 | writable-account CU limit = 12,000,000 |
+| +0x800 / +0x810 / +0x818 | per-tick computed CU rates (rescaled by elapsed slot time) |
+| +0x820 | bank/working-bank handle |
+| +0x828 | finished-work / aux Arc |
+| +0x830 | exit flag |
+| +0x838 | standby flag |
+| +0x860 | current leader slot (sentinel `1,000,000,000` = not leader) |
+| +0x868 | `RakuraiTransactionContainer` (slab + MinMaxHeap + BTreeMap; cap 100000) |
+| +0x2e0 | `RakuraiScheduler` (0x4d0 bytes) |
+
+### A.2 `SwitchingController` (0xA8 bytes; from `SwitchingController::new`)
+
+| Offset | Field |
+|---|---|
+| +0x10..0x18 | config / cluster handle |
+| +0x30 | identity/cluster-info Arc (source of `create_message` id) |
+| +0x60..0x80 | **BlockBuilder authority pubkey** (32 B; base58-decoded from rodata `0x37dc5f`) |
+| +0xA8 | `enabled` bool (read by `rakurai_enabled()`) |
+
+### A.3 `ThreadAwareAccountLocks` entry
+Hashbrown table keyed by 32-byte account pubkey; **each value entry = 0x148 (328) bytes** holding
+per-thread read/write lock counts. `read/write_schedulable_threads` probe it to produce the
+eligible-thread bitmask; `try_lock_accounts`/`lock_accounts`/`unlock_accounts` mutate it.
+
+### A.4 `RakuraiTransactionViewReceiveAndBuffer`
+| Offset | Field |
+|---|---|
+| +0x18 | "tip accounts known" flag |
+| +0x20..0x4c | tip-account hashbrown set (written under a seqlock at +0x10 = `0x3fffffff` sentinel) |
+| +0x250 | tip-account RwLock (touched during packet buffering) |
+| +0x600 | receiver state root used by `set_rakurai_tip_accounts` |
+
+### A.5 `CooccurrenceGraph`
+| Offset | Field |
+|---|---|
+| +0x00..0x90 | `petgraph::GraphMap` (nodes = account pubkeys, weighted co-occurrence edges) |
+| +0x90..0x120 | auxiliary hashbrown maps (account→node, edge weights) |
+| +0x120 | **f64 edge-weight threshold** |
+| output | `HashMap<usize, GroupDetails>`; bucket 0x30 = usize key + `GroupDetails` ≈ 40 B |
+
+### A.6 Global GOT / control slots
+`0xe37380` standby · `0xe37388` run-gate (2=normal) · `0xe37390` notifier once ·
+`0xe37398` `SWITCHING_CONTROLLER` once_cell · `0xe37xxx`–`0xe38xxx` the load-time-populated indirect
+call table (see §3). Graph slots: `build_graph 0xe38210`, `connected_groups 0xe38218`,
+`process_transaction 0xe382a0`, `CooccurrenceGraph::new 0xe382b0`, clock `0xe38230`.
+
+---
+
+# APPENDIX B — Complete function-by-function reference
+
+Every analyzed Rakurai function (112 total in the symbol table excluding drop glue; the
+substantive ones below). Sizes are the symbol-table byte sizes.
+
+### B.1 Entry / control plane
+- **`run_rakurai_scheduler`** (6468 B) — C-ABI entry. Panic hook, `SwitchingController::new`,
+  once_cell store, mode-enum validation, 0x200 struct alloc, spawn threads. 6-case source-mode jump
+  table (local branches, `0x6bcd7d`–`0x6bcdf3`).
+- **`run_rakurai_scheduler::{{closure}}`** (23943 B) — manager thread; 76-case monomorphization
+  table; creates the `HashMap<usize,GroupDetails>` channel; spawns scheduler + receiver + notifier;
+  shutdown joins/drops.
+- **`SwitchingController::new`** (663 B) — decodes hardcoded authority key → +0x60.
+- **`SwitchingController::is_rakurai_enabled`** (1201 B) — checks standby `0xe37380`; acquires the
+  config `Mutex`/RwLock; verifies signature if a signed command is present.
+- **`SwitchingController::verify_signature`** — ed25519 verify over `create_message(slot)`; tries
+  `slot` and `slot-1`.
+- **`SwitchingController::create_message`** — `bincode(struct{ id, pubkey, slot })` under a seqlock.
+- **`rakurai_enabled`** — read bool @ `SWITCHING_CONTROLLER+0xA8`.
+- **`check_state`** — per-tick `wait_or_proceed`.
+- **`initial_check_state_for_standard` / `initial_check_state_for_rakurai`** — startup gates.
+- **`reset_rakurai`** — run-gate=2, standby=0.
+- **`force_switch_to_standard`** (760 B) — standby=1, drain finished work, enabled=0, 200/100 ms
+  backoff, drop receivers → stock Agave.
+- **`entrypoint`** — module init.
+
+### B.2 scheduler_1 (greedy family)
+- **`Controller::run`** (9336 B) — the main loop (§5.1).
+- **`Controller::new`** (1846 B) — struct init + constants (Appendix A.1).
+- **`Controller::receive_and_buffer_transactions`** (2679 B) — pull txs from the two receivers into
+  the container; high-prio fork.
+- **`Controller::update_actual_cus_and_print_logs`** (884 B) — realized-CU feedback ring buffer.
+- **`Controller::redump_filtered_txns`** (738 B) — requeue throttled txs.
+- **`RakuraiScheduler::rakurai_schedule`** (9354 B) — the pop_max→lock→thread→send_batch loop.
+- **`RakuraiScheduler::send_batch`** (1766 B) — `take_batch` → `ConsumeWork` → `Sender::try_send`.
+- **`RakuraiScheduler::passthrough_priority`** (8 B) — `return *arg1` (stock fee/CU).
+- **`RakuraiScheduler::get_writable_accts`** — writable-account set extraction.
+- **`RakuraiScheduler::select_thread`** — least-loaded eligible thread.
+- **`RakuraiScheduler::redump_cu_throttled_ids_to_container`** (3351 B) — CU-throttle requeue.
+- **`receive_completed_rakurai`** (5033 B) — drain finished work, unlock, requeue retryables.
+- **`retry_interval_tx_ids`** (3997 B) / **`retry_tx_end_of_slot`** (1303 B) /
+  **`refresh_if_needed`** (1180 B) — retry/backoff + blockhash expiry (§5.7).
+- **`ThreadAwareAccountLocks`**: `try_lock_accounts` (1375 B), `unlock_accounts` (1230 B),
+  `read_lock_account` (685 B), `write_lock_account`, `read/write_schedulable_threads`,
+  `read/write_unlock_account`, `new`.
+- **`SchedulerCountMetricsInner::report`** (1529 B) — count metrics.
+
+### B.3 scheduler_2 (graph-aware family)
+- **`SchedulerStatsController::receive_and_buffer_transactions`** (6016 B) — sched2 ingest driver.
+- **`RakuraiScheduler::schedule_2`** (18261 B) — sched2 pack loop (pop_max + find_least_loaded).
+- **`receive_completed_2`** (7382 B) — sched2 completion/unlock/requeue.
+- **`redump_acct_limit_reached_to_container`** (5565 B) / **`redump_cu_throttled_ids_to_container`**
+  (4741 B) — sched2 requeue variants.
+- **`find_least_loaded_thread`** (1657 B) — sched2 thread pick (per-thread load @ +0x80/+0x190).
+- **`get_writable_accts`** (613 B), **`get_retry_interval_times_ms`** (647 B),
+  **`InFlightTracker::new`** (424 B), **`Batches::new`**.
+- **`ThreadAwareAccountLocks`** (sched2 copy): `lock_accounts`, `read/write_lock_account`,
+  `read/write_schedulable_threads`, `new`.
+- **`SchedulerCountMetricsInner::report`** (1573 B).
+
+### B.4 Co-occurrence graph (scheduler_2)
+- **`CooccurrenceGraph::new`** (619 B) — `GraphMap::with_capacity` + f64 threshold.
+- **`build_graph`** (1186 B) — `add_edge` per co-occurring account pair (GOT `0xe38210`).
+- **`process_transaction`** (1895 B) — per-tx account-pair clique into edge map (GOT `0xe382a0`).
+- **`connected_groups`** (2210 B) — BFS/DFS components → `HashMap<usize,GroupDetails>`
+  (GOT `0xe38218`). Live: called from `SchedulerReceiver::run`, consumed by
+  `SchedulerStatsController`.
+
+### B.5 Receiver / ingestion
+- **`SchedulerReceiver::run`** (20239 B) — ingest thread; also builds the co-occurrence graph.
+- **`SchedulerReceiver::new`** (1694 B).
+- **`RakuraiTransactionViewReceiveAndBuffer::receive_and_buffer_packets`** (4581 B) — wire packet
+  loop (§6.1).
+- **`deserialize_and_push_received_batches`** (20239 B) + **`::{{closure}}`** (2029 B) — batch
+  driver.
+- **`try_handle_packet`** (4131 B) — parse, ALT-resolve, dedup (`contains_key`), sanitize.
+- **`is_mode1_filtered`** (1599 B) — light structural admission.
+- **`is_mode2_filtered`** (4477 B) — heavy admission with `calculate_fee_details` +
+  `CostModel::calculate_cost`.
+- **`generate_packet_indexes`** (926 B) — batch index table.
+- **`get_writable_accts`** (731 B), **`RakuraiTransactionViewReceiveAndBuffer::new`** (1280 B),
+  **`::clone`** (2220 B).
+- **`reception_info_log` / `reception_warning_log`**, **`SchedulerCountMetricsInner::report`**
+  (reception metrics, 655 B).
+
+### B.6 Transaction container
+- **`RakuraiTransactionContainer::push_ids_into_queue`** (three monomorphizations, ~1276–1465 B) —
+  slab insert + MinMaxHeap push + BTreeMap index (§5.2).
+
+### B.7 Tip / bundle
+- **`rakurai_tip_amount_from_transaction`** (1053 B) — SIMD tip-account probe + lamport sum.
+- **`set_rakurai_tip_accounts`** — register tip accounts under seqlock.
+- **`fetch_bundle_tip`** — bundle tip via `BUNDLE_STAGE_CONTROLLER`.
+- **`check_bundle_feasability`** — `cost < 3 caps`.
+
+### B.8 Network / notifier
+- **`SchedulerUpdateNotifier::run`** (9170 B) + **`::new`** — tokio thread `solSchedTokio`.
+- **`sync_postpack_confirmation_config`** (16036 B) + **`::{{closure}}`** (13317 B) — read config
+  PDA, Borsh-decode, gossip-resolve nodes.
+- **`dispatch_scheduler_update`** (3049 B) — HKDF per-update key, push per node via tokio mpsc.
+- **`handle_postpack_confirmation_stream::{{closure}}`** (21181 B) — the tonic gRPC bidirectional
+  stream: `Streaming::poll_next`, `Grpc::create_response`, `mpsc::Sender::send`; re-auths via
+  `generate_auth_tokens_relayer`.
+- **`generate_auth_tokens_relayer`** (25784 B) + **`::{{closure}}`** (25857 B) — the Jito relayer
+  challenge/response auth (largest functions in the binary; sign identity, exchange bearer tokens).
+- **`endpoint_from_url`** (1303 B) — tonic endpoint + rustls TLS for https.
+
+### B.9 Metrics
+Multiple `SchedulerCountMetricsInner::report`, `SchedulerTimingMetricsInner::report`,
+`RakuraiSchedulerCountMetrics::update`, `RakuraiSchedulerLeaderDetectionMetrics::report_and_reset`
+across scheduler_1, scheduler_2, and reception — standard `solana_metrics` InfluxDB counters/timers
+(slot, scheduled/unschedulable counts, CU totals, latencies). No effect on scheduling logic.
+
+---
+
+# APPENDIX C — End-to-end lifecycle (one leader slot)
+
+1. Validator calls `run_rakurai_scheduler` (once); manager spawns receiver + scheduler + notifier
+   threads; `SwitchingController` gate is checked (remote enable).
+2. **Ingest**: packets arrive → `receive_and_buffer_packets` → `try_handle_packet` (ALT-resolve,
+   dedup, sanitize) → `is_mode1_filtered`/`is_mode2_filtered` (admission; mode 2 prices fee+cost) →
+   tip valuation → push into container (heap + BTree + slab) or the high-priority lane.
+   Concurrently, for scheduler_2, `build_graph` + `connected_groups` compute account clusters and
+   send `GroupDetails` to the scheduler.
+3. **Schedule** (per tick): gate → leader check → buffer → CU budget (0.85 pacing) → `pop_max` →
+   `get_writable_accts` → `read/write_schedulable_threads` (eligibility bitmask) → `select_thread`/
+   `find_least_loaded_thread` → block-limit gate → `send_batch` → `ConsumeWork` on `work_senders`.
+4. **Complete**: `finished_work_receiver` → `receive_completed_*` → release locks → requeue
+   retryables (retry-interval backoff; blockhash refresh).
+5. **Confirm**: packed txs → `dispatch_scheduler_update` (HKDF key) →
+   `SchedulerUpdateNotifier::run` → gRPC `block_engine::PacketBatchUpdate` to whitelisted nodes.
+6. **End of slot**: `retry_tx_end_of_slot` drains the heap; metrics `report_and_reset`.
+7. **Disable path**: a signed command (or startup config) → `force_switch_to_standard` → drain →
+   revert to stock Agave, no crash.
 
 Analyzed artifact: `extracted/librak_scheduler_4_0_3_0.so` (BuildID `b9350e46e896b42a0adc5c4ca0d0cc3741592724`).
