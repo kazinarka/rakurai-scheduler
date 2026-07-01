@@ -67,9 +67,14 @@ The manager entry `run_rakurai_scheduler` runs on thread **`solBnkSchedulerManag
 
 The binary ships **two scheduler families** — `scheduler_1` (greedy packer only) and `scheduler_2`
 (greedy packer **+** co-occurrence graph). Both `Controller::run` (sched1) and
-`SchedulerStatsController` (sched2) are real thread entry points; which one a deployment runs is a
-startup/config choice **[needs dynamic confirmation of the selector]**. Everything else (receiver,
-notifier, kill-switch) is shared.
+`SchedulerStatsController` (sched2) are real thread entry points. **Selector (resolved):** the
+manager closure reads a **config byte at offset +0x10** of the mode object (`movzbl 0x10(%rax)` at
+`0x67e86c`) and dispatches through the 76-entry jump table at `0x37c56c` to construct sched1 or
+sched2 (both monomorphizations are present in the binary — confirmed by drop glue for
+`scheduler_1::Controller<…>` and `scheduler_2::SchedulerStatsController<…>` in the closure). So the
+choice is a **validator-supplied config value**, not a hardcoded constant; the exact enum value used
+by a given deployment is set outside the `.so`. Everything else (receiver, notifier, kill-switch) is
+shared.
 
 ---
 
@@ -146,11 +151,25 @@ State lives in `RakuraiTransactionContainer` (struct+0x868, **capacity 100000 tx
 - a **`min_max_heap::MinMaxHeap`** of `(priority, id)`: `push` on insert, **`pop_max`** to take the
   best next tx, with O(1) access to the *min* end for capacity-bounded eviction.
 
-**The priority key is stock Solana, not a Rakurai invention.** `passthrough_priority` is literally
-`return *arg1` — the first u64 of the tx-state struct, filled by Agave's
-`calculate_priority_and_cost` (seen called directly in `receive_completed_2`) =
-**priority = fee ÷ (compute-unit-limit + 1)**. Ordering is byte-for-byte vanilla Agave; the edge is
-everything *around* the ordering.
+**The priority key is Agave's formula shape, but with the MEV tip folded into the numerator — this
+is Rakurai's core economic edge.** `passthrough_priority` is literally `return *arg1` — the first
+u64 of the tx-state struct. That u64 is computed at packet-handling time in `try_handle_packet`
+(disassembly `0x5dde20`–`0x5dde5f`), and the exact arithmetic is:
+
+```
+value    = base_fee_value + tip_lamports          ; r15, saturating add (tip from §6.3)
+priority = (value * 1_000_000) / (cost + 1)        ; r14 = value*1e6 / (CostModel_cost + 1)
+```
+
+- `1_000_000` and `/(cost+1)` are Agave's standard priority scaling (fee-per-CU × 1e6).
+- **The difference from stock Agave is `value`**: Rakurai adds the transaction's realized **tip
+  lamports** (computed by `rakurai_tip_amount_from_transaction`, §6.3) into the numerator before
+  dividing by cost. So a tip-paying transaction gets a *higher priority key* and therefore sorts
+  earlier in the `pop_max` order. There is **no separate "fast-lane threshold"** — the tip is a
+  continuous additive term in the priority itself (the `tip != 0` test at `0x5ddd9d` only skips the
+  scaling math when there is no tip). `cost` is the real `CostModel::calculate_cost` value, not an
+  estimate. (`calculate_priority_and_cost` recomputes the same key when a tx is requeued in
+  `receive_completed_2`.)
 
 The greedy loop (`rakurai_schedule`, confirmed calls): repeatedly `pop_max` → `get_writable_accts`
 → conflict check → thread select → accumulate into a per-thread batch → `send_batch`; txs that can't
@@ -291,8 +310,15 @@ Wiring (proven via the GOT technique of §3):
 
 **Why:** clustering accounts by co-occurrence *off the critical path* lets the packer keep related
 accounts coherent across threads, reducing cross-thread write-lock contention → more parallelism per
-slot. This is scheduler_2's distinguishing feature over scheduler_1. The exact per-decision use of
-`GroupDetails` inside the scheduler is closure-buried **[needs dynamic confirmation]**.
+slot. This is scheduler_2's distinguishing feature over scheduler_1.
+
+**`GroupDetails` layout (recovered):** the map value is **40 bytes** (`connected_groups` builds it
+with 0x28-stride stores and 0x30-byte hashbrown buckets). The layout is ~5 × u64 fields — consistent
+with a `Vec` handle (ptr/len/cap = 24 B) of member ids plus two aggregate u64s (e.g. member count
+and summed CU/priority). **Field *names* are not recoverable** — Rust compiles struct field names
+away; only offsets/sizes survive in a stripped-of-debuginfo release build. The exact per-decision
+use of the group hints inside the scheduler is dispatched through the consumer's closure and is the
+one behavior that would still benefit from a live trace to pin precisely.
 
 ---
 
@@ -364,9 +390,14 @@ The scheduler is created with an **extra crossbeam pair**
 `high_priority_transaction_sender/_receiver` (struct+0x7b0) that stock Agave lacks. During ingestion
 (`receive_and_buffer_transactions`), when a tx's destination enum selects the high-prio sender it is
 `try_send` onto that lane; the main loop's `wait_or_proceed` checks the fast lane's non-emptiness
-**first**, so tip/bundle transactions are scheduled ahead of the ordinary priority heap during a
-leader slot. (The exact tip-lamports threshold that flips a tx onto the lane is config/parameter
-driven **[needs dynamic confirmation]**; the mechanism — compute tip, compare, route — is fixed.)
+**first**, so lane transactions are scheduled ahead of the ordinary priority heap during a leader
+slot.
+
+**Resolved:** there is **no tunable tip-lamports threshold** for the lane. Two mechanisms make tips
+win, both static-confirmed: (1) the tip is added into the **priority numerator** (§5.2), so a
+tip-payer outranks equal-fee non-tippers in the ordinary heap regardless; (2) the extra lane exists
+for bundle/high-priority routing and is drained first. The only tip test in code is `tip != 0`
+(`0x5ddd9d`), which merely selects whether the tip-scaling math runs — not a minimum-tip gate.
 
 ### 6.5 Bundles (Jito MEV)
 
@@ -695,5 +726,33 @@ across scheduler_1, scheduler_2, and reception — standard `solana_metrics` Inf
 6. **End of slot**: `retry_tx_end_of_slot` drains the heap; metrics `report_and_reset`.
 7. **Disable path**: a signed command (or startup config) → `force_switch_to_standard` → drain →
    revert to stock Agave, no crash.
+
+---
+
+# APPENDIX D — Resolution of the previously-open questions
+
+Three items were earlier flagged as needing dynamic analysis. Deeper static work resolved all three
+from the image alone (dynamic tracing is infeasible here — the `.so` is a Linux ELF and driving live
+scheduling needs a funded leader validator; it is also unnecessary for these):
+
+1. **Tip → priority mechanism (fully resolved, static).** There is no configurable tip threshold and
+   no separate economic lane gate. In `try_handle_packet` the realized tip lamports are **added into
+   the priority numerator**: `priority = ((base_fee_value + tip) * 1_000_000) / (CostModel_cost + 1)`
+   (disasm `0x5dde20`–`0x5dde5f`). Tips therefore raise the exact key the `MinMaxHeap` orders by. The
+   only tip test is `tip != 0` (`0x5ddd9d`), which just gates the scaling math. This is the single
+   most important economic finding: **Rakurai's priority = Agave's fee-per-CU with the MEV tip folded
+   into the fee.**
+
+2. **scheduler_1 vs scheduler_2 selection (resolved).** The manager closure reads a config byte at
+   `+0x10` of the mode object (`movzbl 0x10(%rax)` @ `0x67e86c`) and dispatches via the 76-entry
+   table at `0x37c56c`. Both scheduler monomorphizations are compiled in; the choice is a
+   validator-supplied config value set outside the `.so`. The mechanism is fully mapped; only the
+   deployment's chosen value lives outside the binary.
+
+3. **`GroupDetails` layout (resolved as far as the binary allows).** 40-byte value, ~5×u64 (likely a
+   `Vec` member-id handle + aggregate counters); see §5.9 / Appendix A.5. Field *names* are compiled
+   away in a release build and cannot be recovered from any static or dynamic inspection of this
+   artifact — only a source drop would give names. The consumer's exact use of the hints is the one
+   behavior a live trace could still sharpen.
 
 Analyzed artifact: `extracted/librak_scheduler_4_0_3_0.so` (BuildID `b9350e46e896b42a0adc5c4ca0d0cc3741592724`).
